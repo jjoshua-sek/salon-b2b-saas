@@ -200,19 +200,19 @@ ALTER TABLE customer_loyalty ENABLE ROW LEVEL SECURITY;
 ALTER TABLE loyalty_transactions ENABLE ROW LEVEL SECURITY;
 
 -- Helper: get current user's role
-CREATE OR REPLACE FUNCTION auth.user_role()
+CREATE OR REPLACE FUNCTION public.user_role()
 RETURNS user_role AS $$
   SELECT role FROM public.users WHERE id = auth.uid();
 $$ LANGUAGE sql SECURITY DEFINER STABLE;
 
 -- Helper: check if current user is admin
-CREATE OR REPLACE FUNCTION auth.is_admin()
+CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN AS $$
   SELECT EXISTS (SELECT 1 FROM public.users WHERE id = auth.uid() AND role = 'admin');
 $$ LANGUAGE sql SECURITY DEFINER STABLE;
 
 -- Helper: get stylist id for current user
-CREATE OR REPLACE FUNCTION auth.stylist_id()
+CREATE OR REPLACE FUNCTION public.stylist_id()
 RETURNS UUID AS $$
   SELECT id FROM public.stylists WHERE user_id = auth.uid();
 $$ LANGUAGE sql SECURITY DEFINER STABLE;
@@ -232,7 +232,7 @@ CREATE POLICY "Users: self update" ON users
 
 -- Admin can do everything
 CREATE POLICY "Users: admin all" ON users
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: stylists
@@ -249,7 +249,7 @@ CREATE POLICY "Stylists: self update" ON stylists
 
 -- Admin can manage all stylists
 CREATE POLICY "Stylists: admin all" ON stylists
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: services
@@ -257,11 +257,11 @@ CREATE POLICY "Stylists: admin all" ON stylists
 
 -- Everyone can read active services
 CREATE POLICY "Services: public read" ON services
-  FOR SELECT USING (is_active = true OR auth.is_admin());
+  FOR SELECT USING (is_active = true OR public.is_admin());
 
 -- Admin can manage services
 CREATE POLICY "Services: admin all" ON services
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: bookings
@@ -273,7 +273,7 @@ CREATE POLICY "Bookings: customer read own" ON bookings
 
 -- Stylists see bookings assigned to them
 CREATE POLICY "Bookings: stylist read own" ON bookings
-  FOR SELECT USING (stylist_id = auth.stylist_id());
+  FOR SELECT USING (stylist_id = public.stylist_id());
 
 -- Customers can create bookings
 CREATE POLICY "Bookings: customer create" ON bookings
@@ -286,7 +286,7 @@ CREATE POLICY "Bookings: customer cancel" ON bookings
 
 -- Admin can do everything with bookings
 CREATE POLICY "Bookings: admin all" ON bookings
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: transactions
@@ -300,7 +300,7 @@ CREATE POLICY "Transactions: customer read own" ON transactions
 
 -- Admin can manage all transactions
 CREATE POLICY "Transactions: admin all" ON transactions
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: reviews
@@ -324,7 +324,7 @@ CREATE POLICY "Reviews: customer create" ON reviews
 
 -- Admin can manage all reviews
 CREATE POLICY "Reviews: admin all" ON reviews
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: portfolio_items
@@ -336,11 +336,11 @@ CREATE POLICY "Portfolio: public read" ON portfolio_items
 
 -- Stylists can manage their own portfolio
 CREATE POLICY "Portfolio: stylist manage own" ON portfolio_items
-  FOR ALL USING (stylist_id = auth.stylist_id());
+  FOR ALL USING (stylist_id = public.stylist_id());
 
 -- Admin can manage all portfolios
 CREATE POLICY "Portfolio: admin all" ON portfolio_items
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: stylist_specializations
@@ -352,7 +352,7 @@ CREATE POLICY "Specializations: public read" ON stylist_specializations
 
 -- Admin can manage specializations
 CREATE POLICY "Specializations: admin all" ON stylist_specializations
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: ai_recommendations
@@ -368,7 +368,7 @@ CREATE POLICY "AI Recs: stylist read for booked customers" ON ai_recommendations
     EXISTS (
       SELECT 1 FROM bookings
       WHERE bookings.customer_id = ai_recommendations.customer_id
-        AND bookings.stylist_id = auth.stylist_id()
+        AND bookings.stylist_id = public.stylist_id()
     )
   );
 
@@ -378,7 +378,7 @@ CREATE POLICY "AI Recs: customer create" ON ai_recommendations
 
 -- Admin can read all recommendations
 CREATE POLICY "AI Recs: admin all" ON ai_recommendations
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: customer_loyalty
@@ -390,7 +390,7 @@ CREATE POLICY "Loyalty: customer read own" ON customer_loyalty
 
 -- Admin can manage all loyalty data
 CREATE POLICY "Loyalty: admin all" ON customer_loyalty
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- RLS POLICIES: loyalty_transactions
@@ -402,7 +402,7 @@ CREATE POLICY "Loyalty TX: customer read own" ON loyalty_transactions
 
 -- Admin can manage all loyalty transactions
 CREATE POLICY "Loyalty TX: admin all" ON loyalty_transactions
-  FOR ALL USING (auth.is_admin());
+  FOR ALL USING (public.is_admin());
 
 -- ============================================================
 -- AUTO-CREATE USER PROFILE ON SIGNUP
