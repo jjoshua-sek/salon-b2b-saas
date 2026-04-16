@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState, useCallback } from "react";
+import { Suspense, useEffect, useState, useCallback, useTransition } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import type { Service, Booking } from "@/types/database";
@@ -37,6 +37,7 @@ function BookingPage() {
   const preselectedService = searchParams.get("service");
   const preselectedStylist = searchParams.get("stylist");
 
+  const [isPending, startTransition] = useTransition();
   const [step, setStep] = useState(1);
   const [services, setServices] = useState<Service[]>([]);
   const [stylists, setStylists] = useState<StylistOption[]>([]);
@@ -62,8 +63,8 @@ function BookingPage() {
       setStylists((stylistsRes.data as unknown as StylistOption[]) ?? []);
       setLoading(false);
 
-      if (preselectedService) setStep(2);
-      if (preselectedStylist) setStep(preselectedService ? 3 : 2);
+      if (preselectedService) startTransition(() => setStep(2));
+      if (preselectedStylist) startTransition(() => setStep(preselectedService ? 3 : 2));
     }
     fetchData();
   }, [preselectedService, preselectedStylist]);
@@ -196,7 +197,7 @@ function BookingPage() {
             {services.map((service) => (
               <button
                 key={service.id}
-                onClick={() => { setSelectedService(service.id); setStep(2); }}
+                onClick={() => { setSelectedService(service.id); startTransition(() => setStep(2)); }}
                 className={`w-full text-left p-3 rounded-md border transition-colors ${
                   selectedService === service.id ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"
                 }`}
@@ -219,13 +220,13 @@ function BookingPage() {
         <Card>
           <CardHeader>
             <CardTitle>Choose a Stylist</CardTitle>
-            <Button variant="ghost" size="sm" onClick={() => setStep(1)}>← Back</Button>
+            <Button variant="ghost" size="sm" onClick={() => startTransition(() => setStep(1))}>← Back</Button>
           </CardHeader>
           <CardContent className="space-y-2">
             {stylists.map((stylist) => (
               <button
                 key={stylist.id}
-                onClick={() => { setSelectedStylist(stylist.id); setStep(3); }}
+                onClick={() => { setSelectedStylist(stylist.id); startTransition(() => setStep(3)); }}
                 disabled={!stylist.is_available}
                 className={`w-full text-left p-3 rounded-md border transition-colors ${
                   !stylist.is_available ? "opacity-50 cursor-not-allowed" :
@@ -251,7 +252,7 @@ function BookingPage() {
         <Card>
           <CardHeader>
             <CardTitle>Pick Date & Time</CardTitle>
-            <Button variant="ghost" size="sm" onClick={() => setStep(2)}>← Back</Button>
+            <Button variant="ghost" size="sm" onClick={() => startTransition(() => setStep(2))}>← Back</Button>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
@@ -275,7 +276,7 @@ function BookingPage() {
                         variant={selectedTime === slot ? "default" : "outline"}
                         size="sm"
                         disabled={isBooked}
-                        onClick={() => { setSelectedTime(slot); setStep(4); }}
+                        onClick={() => { setSelectedTime(slot); startTransition(() => setStep(4)); }}
                         className={isBooked ? "opacity-30 line-through" : ""}
                       >
                         {slot}
@@ -294,7 +295,7 @@ function BookingPage() {
         <Card>
           <CardHeader>
             <CardTitle>Confirm Booking</CardTitle>
-            <Button variant="ghost" size="sm" onClick={() => setStep(3)}>← Back</Button>
+            <Button variant="ghost" size="sm" onClick={() => startTransition(() => setStep(3))}>← Back</Button>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2 text-sm">

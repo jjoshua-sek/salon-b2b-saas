@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import Image from "next/image";
 import Link from "next/link";
 import { Star } from "lucide-react";
 
@@ -123,7 +124,7 @@ export default function StylistProfilePage() {
           <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-3">
             {portfolio.map((item) => (
               <Card key={item.id} className="overflow-hidden">
-                <img src={item.image_url} alt={item.title ?? "Portfolio"} className="aspect-square object-cover w-full" />
+                <Image src={item.image_url} alt={item.title ?? "Portfolio"} width={400} height={400} className="aspect-square object-cover w-full" />
                 <CardContent className="p-3">
                   {item.title && <p className="font-medium text-sm">{item.title}</p>}
                   {item.tags && (

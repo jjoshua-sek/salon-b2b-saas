@@ -8,7 +8,7 @@
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --font-mono: ui-monospace, monospace;
   --font-heading: var(--font-playfair), "Playfair Display", Georgia, serif;
   --color-gold: #b8975a;
   --color-gold-light: #d4b87a;

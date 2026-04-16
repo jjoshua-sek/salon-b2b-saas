@@ -1,15 +1,11 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono, Playfair_Display } from "next/font/google";
+import { Geist, Playfair_Display } from "next/font/google";
 import { SpeedInsights } from "@vercel/speed-insights/next";
+import { Analytics } from "@vercel/analytics/next";
 import "./globals.css";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
   subsets: ["latin"],
 });
 
@@ -28,14 +24,25 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} ${playfair.variable} h-full antialiased dark`}
+      className={`${geistSans.variable} ${playfair.variable} h-full antialiased dark`}
     >
+      <head>
+        {supabaseUrl && (
+          <>
+            <link rel="preconnect" href={supabaseUrl} />
+            <link rel="dns-prefetch" href={supabaseUrl} />
+          </>
+        )}
+      </head>
       <body className="min-h-full flex flex-col">
         {children}
         <SpeedInsights />
+        <Analytics />
       </body>
     </html>
   );

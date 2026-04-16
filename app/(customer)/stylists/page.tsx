@@ -1,13 +1,9 @@
-"use client";
-
-import { useEffect, useState } from "react";
-import { createClient } from "@/lib/supabase/client";
+import { createClient } from "@/lib/supabase/server";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import Link from "next/link";
-import { Star } from "lucide-react";
 
 interface StylistWithUser {
   id: string;
@@ -20,22 +16,14 @@ interface StylistWithUser {
   user: { full_name: string; avatar_url: string | null } | null;
 }
 
-export default function StylistsPage() {
-  const [stylists, setStylists] = useState<StylistWithUser[]>([]);
-  const [loading, setLoading] = useState(true);
+export default async function StylistsPage() {
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("stylists")
+    .select("*, user:users!stylists_user_id_fkey(full_name, avatar_url)")
+    .order("created_at");
 
-  useEffect(() => {
-    async function fetchStylists() {
-      const supabase = createClient();
-      const { data } = await supabase
-        .from("stylists")
-        .select("*, user:users!stylists_user_id_fkey(full_name, avatar_url)")
-        .order("created_at");
-      setStylists((data as StylistWithUser[]) ?? []);
-      setLoading(false);
-    }
-    fetchStylists();
-  }, []);
+  const stylists = (data as StylistWithUser[]) ?? [];
 
   return (
     <div className="space-y-8">
@@ -44,9 +32,7 @@ export default function StylistsPage() {
         <p className="text-muted-foreground mt-1">Meet our talented team</p>
       </div>
 
-      {loading ? (
-        <p className="text-muted-foreground">Loading stylists...</p>
-      ) : stylists.length === 0 ? (
+      {stylists.length === 0 ? (
         <Card>
           <CardContent className="py-8 text-center text-muted-foreground">
             No stylists added yet. Check back soon!

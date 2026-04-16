@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Plus, Trash2 } from "lucide-react";
+import Image from "next/image";
 
 interface PortfolioRow {
   id: string;
@@ -111,7 +112,7 @@ export default function StylistPortfolioPage() {
         <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-3">
           {items.map((item) => (
             <Card key={item.id} className="overflow-hidden group relative">
-              <img src={item.image_url} alt={item.title ?? "Portfolio"} className="aspect-square object-cover w-full" />
+              <Image src={item.image_url} alt={item.title ?? "Portfolio"} width={400} height={400} className="aspect-square object-cover w-full" />
               <CardContent className="p-3">
                 {item.title && <p className="font-medium text-sm">{item.title}</p>}
                 {item.tags && (
