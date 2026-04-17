@@ -1,39 +1,12 @@
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { Scissors, Calendar, Sparkles, Star } from "lucide-react";
+import { Calendar, Sparkles, Star } from "lucide-react";
+import { SiteNavbar } from "@/components/site-navbar";
 
-export default function Home() {
+export default async function Home() {
   return (
     <div className="flex flex-col min-h-screen bg-[#0a0a0a]">
-      {/* Nav */}
-      <header className="border-b border-[#2a2520]">
-        <div className="container mx-auto flex h-16 items-center justify-between px-4">
-          <Link href="/" className="flex items-center gap-2">
-            <Scissors className="h-6 w-6 text-gold" />
-            <span className="font-heading text-xl font-bold tracking-wider text-white">SALON</span>
-          </Link>
-          <nav className="hidden md:flex items-center gap-8">
-            <Link href="/services" className="text-sm font-medium tracking-widest uppercase text-[#8a8478] hover:text-gold transition-colors">
-              Services
-            </Link>
-            <Link href="/stylists" className="text-sm font-medium tracking-widest uppercase text-[#8a8478] hover:text-gold transition-colors">
-              Stylists
-            </Link>
-          </nav>
-          <div className="flex items-center gap-3">
-            <Link href="/login">
-              <Button variant="ghost" className="text-[#8a8478] hover:text-gold hover:bg-transparent tracking-wider uppercase text-xs">
-                Log in
-              </Button>
-            </Link>
-            <Link href="/signup">
-              <Button className="bg-gold text-[#0a0a0a] hover:bg-gold-light tracking-wider uppercase text-xs font-semibold">
-                Sign up
-              </Button>
-            </Link>
-          </div>
-        </div>
-      </header>
+      <SiteNavbar />
 
       {/* Hero */}
       <main className="flex-1">
@@ -49,7 +22,9 @@ export default function Home() {
             Book appointments, get AI-powered hairstyle recommendations, and discover your perfect stylist.
           </p>
           <div className="flex gap-4 mt-4">
-            <Link href="/signup">
+            {/* /book is auth-gated by middleware; unauthenticated users get
+                bounced to /login?redirect=/book and routed back after sign-in. */}
+            <Link href="/book">
               <Button size="lg" className="bg-gold text-[#0a0a0a] hover:bg-gold-light tracking-wider uppercase text-xs font-semibold px-8 py-6">
                 Book Now
               </Button>

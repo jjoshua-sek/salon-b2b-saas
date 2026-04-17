@@ -67,12 +67,13 @@ export async function updateSession(request: NextRequest) {
       return NextResponse.redirect(new URL("/", request.url));
     }
 
-    // Prevent non-stylists from accessing stylist routes
-    if (
-      pathname.startsWith("/stylist") &&
-      role !== "stylist" &&
-      role !== "admin"
-    ) {
+    // Prevent non-stylists from accessing stylist dashboard routes.
+    // NOTE: use exact match + trailing slash — `startsWith("/stylist")` would
+    // also match `/stylists` (customer-facing listing) and `/stylists/[id]`,
+    // which are PUBLIC browsing pages. See publicRoutes above.
+    const isStylistDashboard =
+      pathname === "/stylist" || pathname.startsWith("/stylist/");
+    if (isStylistDashboard && role !== "stylist" && role !== "admin") {
       return NextResponse.redirect(new URL("/", request.url));
     }
   }

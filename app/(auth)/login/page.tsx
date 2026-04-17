@@ -23,6 +23,9 @@ function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const urlError = searchParams.get("error");
+  // Honor ?redirect=/some/path — set by middleware when an unauthenticated
+  // user tries to reach a protected route (e.g. Book Now → /book).
+  const redirectTo = searchParams.get("redirect");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(urlError ?? "");
@@ -50,7 +53,16 @@ function LoginForm() {
         .eq("id", user.id)
         .single();
 
-      if (profile?.role === "admin") {
+      // Guard: only honor same-origin relative paths. An absolute URL in
+      // ?redirect= could otherwise send users off to a phishing site.
+      const safeRedirect =
+        redirectTo && redirectTo.startsWith("/") && !redirectTo.startsWith("//")
+          ? redirectTo
+          : null;
+
+      if (safeRedirect) {
+        router.push(safeRedirect);
+      } else if (profile?.role === "admin") {
         router.push("/admin");
       } else if (profile?.role === "stylist") {
         router.push("/stylist");
