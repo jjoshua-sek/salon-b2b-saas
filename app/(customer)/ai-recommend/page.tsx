@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, useTransition } from "react";
+import { useState, useRef, useCallback, useTransition, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -15,11 +15,35 @@ import {
   Loader2,
   Star,
   Check,
+  X,
+  Lock,
+  ScanFace,
 } from "lucide-react";
 import {
   FACE_SHAPE_INFO,
+  classifyFaceShape,
   type FaceShape,
 } from "@/lib/ai/face-shape";
+
+// Lazy-loaded face detector. TF.js + MediaPipe weights are ~20 MB, so
+// load on demand and cache in a ref — the same instance handles both
+// the one-shot upload flow and the continuous live-camera flow.
+async function createFaceDetector() {
+  const tf = await import("@tensorflow/tfjs");
+  await tf.ready();
+  const fld = await import("@tensorflow-models/face-landmarks-detection");
+  return fld.createDetector(fld.SupportedModels.MediaPipeFaceMesh, {
+    runtime: "tfjs",
+    refineLandmarks: true,
+    maxFaces: 1,
+  });
+}
+type FaceDetector = Awaited<ReturnType<typeof createFaceDetector>>;
+
+// Detection loop cadence + stability window.
+const DETECT_INTERVAL_MS = 450;   // ~2 FPS; enough to feel live, light on CPU
+const STABILITY_WINDOW = 5;       // last N classifications kept
+const STABILITY_THRESHOLD = 3;    // this many agreeing classifications -> lock
 import type {
   HairType,
   DesiredLength,
@@ -58,7 +82,31 @@ export default function AIRecommendPage() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [cameraActive, setCameraActive] = useState(false);
+
+  // Shared detector — warmed up by the first user flow that needs it
+  // (upload or camera) and reused thereafter.
+  const detectorRef = useRef<FaceDetector | null>(null);
+  const ensureDetector = useCallback(async (): Promise<FaceDetector> => {
+    if (!detectorRef.current) {
+      detectorRef.current = await createFaceDetector();
+    }
+    return detectorRef.current;
+  }, []);
+
+  // Live camera state. `cameraStatus` drives which UI block renders;
+  // `liveShape` + `stabilityCount` + `locked` are the real-time readout.
+  const [cameraStatus, setCameraStatus] = useState<
+    "idle" | "starting" | "running" | "error"
+  >("idle");
+  const [liveShape, setLiveShape] = useState<FaceShape | null>(null);
+  const [stabilityCount, setStabilityCount] = useState(0);
+  const [locked, setLocked] = useState(false);
+
+  // Detection loop + history buffer live in refs so they survive
+  // re-renders without firing them. The interval is strictly owned
+  // by start/stopCamera.
+  const loopRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const historyRef = useRef<FaceShape[]>([]);
 
   const goTo = useCallback((s: Step) => startTransition(() => setStep(s)), [startTransition]);
 
@@ -73,19 +121,7 @@ export default function AIRecommendPage() {
     reader.readAsDataURL(file);
 
     try {
-      // Dynamically import TF.js (heavy — only load when needed)
-      const tf = await import("@tensorflow/tfjs");
-      await tf.ready();
-
-      const faceLandmarksDetection = await import("@tensorflow-models/face-landmarks-detection");
-      const { classifyFaceShape } = await import("@/lib/ai/face-shape");
-
-      const model = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
-      const detector = await faceLandmarksDetection.createDetector(model, {
-        runtime: "tfjs",
-        refineLandmarks: true,
-        maxFaces: 1,
-      });
+      const detector = await ensureDetector();
 
       // Create image element from file
       const img = new Image();
@@ -112,41 +148,107 @@ export default function AIRecommendPage() {
       setDetectionError("Face detection failed. Please select your face shape manually.");
       setDetecting(false);
     }
-  }, [goTo]);
+  }, [goTo, ensureDetector]);
 
-  // ── Camera Handler ──
+  // ── Live Camera Handlers ──
+
+  const stopCamera = useCallback(() => {
+    if (loopRef.current != null) {
+      clearInterval(loopRef.current);
+      loopRef.current = null;
+    }
+    const video = videoRef.current;
+    if (video?.srcObject) {
+      const stream = video.srcObject as MediaStream;
+      stream.getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
+    }
+    historyRef.current = [];
+    setLiveShape(null);
+    setStabilityCount(0);
+    setLocked(false);
+    setCameraStatus("idle");
+  }, []);
+
   const startCamera = useCallback(async () => {
+    setDetectionError("");
+    setCameraStatus("starting");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: 640, height: 480 },
       });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setCameraActive(true);
+      const video = videoRef.current;
+      if (!video) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
       }
+      video.srcObject = stream;
+      await video.play();
+
+      // Kick off detector load alongside the stream so the first
+      // frame is ready to classify as soon as possible.
+      const detector = await ensureDetector();
+
+      setCameraStatus("running");
+
+      // Detection loop. Each tick: run estimateFaces on the current
+      // video frame, classify, push into the sliding history buffer,
+      // and update the stability count. Lock when STABILITY_THRESHOLD
+      // of the last STABILITY_WINDOW classifications agree.
+      loopRef.current = setInterval(async () => {
+        const v = videoRef.current;
+        if (!v || v.readyState < 2) return;
+
+        try {
+          const faces = await detector.estimateFaces(v);
+          if (faces.length === 0) {
+            historyRef.current = [];
+            setLiveShape(null);
+            setStabilityCount(0);
+            setLocked(false);
+            return;
+          }
+
+          const landmarks = faces[0].keypoints.map((kp) => ({ x: kp.x, y: kp.y }));
+          const shape = classifyFaceShape(landmarks);
+
+          historyRef.current.push(shape);
+          if (historyRef.current.length > STABILITY_WINDOW) historyRef.current.shift();
+
+          const matching = historyRef.current.filter((s) => s === shape).length;
+          setLiveShape(shape);
+          setStabilityCount(matching);
+          setLocked(matching >= STABILITY_THRESHOLD);
+        } catch {
+          // swallow per-frame errors; the loop will recover on the next tick
+        }
+      }, DETECT_INTERVAL_MS);
     } catch {
-      setDetectionError("Camera access denied. Please upload a photo instead.");
+      setCameraStatus("error");
+      setDetectionError("Camera access denied. Please upload a photo or pick your face shape manually.");
     }
+  }, [ensureDetector]);
+
+  const acceptLiveResult = useCallback(() => {
+    if (!liveShape || !locked) return;
+    const accepted = liveShape;
+    stopCamera();
+    setFaceShape(accepted);
+    goTo("preferences");
+  }, [liveShape, locked, stopCamera, goTo]);
+
+  // Guarantee cleanup: stop camera when step leaves "detect" and on unmount.
+  useEffect(() => {
+    if (step !== "detect" && cameraStatus !== "idle") {
+      stopCamera();
+    }
+  }, [step, cameraStatus, stopCamera]);
+
+  useEffect(() => {
+    return () => stopCamera();
+    // stopCamera is stable (empty deps), safe to depend on once
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const captureFromCamera = useCallback(async () => {
-    if (!videoRef.current) return;
-    const canvas = document.createElement("canvas");
-    canvas.width = videoRef.current.videoWidth;
-    canvas.height = videoRef.current.videoHeight;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(videoRef.current, 0, 0);
-
-    // Stop camera
-    const stream = videoRef.current.srcObject as MediaStream;
-    stream?.getTracks().forEach((t) => t.stop());
-    setCameraActive(false);
-
-    canvas.toBlob((blob) => {
-      if (blob) handlePhotoUpload(new File([blob], "camera-capture.jpg", { type: "image/jpeg" }));
-    }, "image/jpeg");
-  }, [handlePhotoUpload]);
 
   // ── Manual Face Shape Selection ──
   const selectManualShape = useCallback(
@@ -238,8 +340,8 @@ export default function AIRecommendPage() {
                 Upload a clear, front-facing photo. Our AI will analyze your facial proportions to determine your face shape.
               </p>
 
-              {/* Photo preview */}
-              {photoPreview && (
+              {/* Photo preview (upload flow) */}
+              {photoPreview && cameraStatus === "idle" && (
                 <div className="flex justify-center">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
@@ -250,20 +352,127 @@ export default function AIRecommendPage() {
                 </div>
               )}
 
-              {/* Camera view */}
-              {cameraActive && (
-                <div className="flex flex-col items-center gap-3">
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="w-64 h-48 object-cover rounded-lg border border-border"
-                  />
-                  <Button onClick={captureFromCamera}>
-                    <Camera className="mr-2 h-4 w-4" />
-                    Capture Photo
-                  </Button>
+              {/* ── Live Camera View ── */}
+              {cameraStatus !== "idle" && (
+                <div className="space-y-3">
+                  <div className="relative mx-auto w-full max-w-md aspect-[4/3] overflow-hidden rounded-lg border border-border bg-black">
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="h-full w-full object-cover"
+                    />
+
+                    {/* Center alignment guide — a faint oval the user
+                        centers their face in. Pointer-events-none so
+                        it never blocks interaction. */}
+                    <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                      <div
+                        className={`h-[78%] w-[58%] rounded-[50%] border-2 border-dashed transition-colors ${
+                          locked
+                            ? "border-gold"
+                            : liveShape
+                              ? "border-primary/60"
+                              : "border-white/30"
+                        }`}
+                      />
+                    </div>
+
+                    {/* Top-left: live status pill */}
+                    <div className="absolute left-3 top-3">
+                      {cameraStatus === "starting" ? (
+                        <span className="inline-flex items-center gap-2 rounded-full bg-black/70 px-3 py-1 text-xs text-white backdrop-blur">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          Starting camera…
+                        </span>
+                      ) : locked ? (
+                        <span className="inline-flex items-center gap-2 rounded-full bg-gold/90 px-3 py-1 text-xs font-semibold text-black backdrop-blur">
+                          <Lock className="h-3 w-3" />
+                          Locked in
+                        </span>
+                      ) : liveShape ? (
+                        <span className="inline-flex items-center gap-2 rounded-full bg-black/70 px-3 py-1 text-xs text-white backdrop-blur">
+                          <ScanFace className="h-3 w-3 text-primary" />
+                          Analyzing…
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-2 rounded-full bg-black/70 px-3 py-1 text-xs text-white/80 backdrop-blur">
+                          <ScanFace className="h-3 w-3" />
+                          Looking for your face
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Top-right: close */}
+                    <button
+                      type="button"
+                      onClick={stopCamera}
+                      aria-label="Stop camera"
+                      className="absolute right-3 top-3 rounded-full bg-black/70 p-1.5 text-white backdrop-blur transition hover:bg-black/90"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+
+                    {/* Bottom: current shape + stability bar */}
+                    {cameraStatus === "running" && (
+                      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-3">
+                        <div className="flex items-center justify-between text-xs text-white">
+                          <span className="flex items-center gap-1.5">
+                            <span className="text-white/70">Detected:</span>
+                            {liveShape ? (
+                              <span className="inline-flex items-center gap-1 font-semibold capitalize">
+                                {FACE_SHAPE_INFO[liveShape].icon}
+                                {FACE_SHAPE_INFO[liveShape].label}
+                              </span>
+                            ) : (
+                              <span className="text-white/50">—</span>
+                            )}
+                          </span>
+                          <span className="text-white/70">
+                            Stability {stabilityCount}/{STABILITY_THRESHOLD}
+                          </span>
+                        </div>
+                        <div className="mt-1.5 flex gap-1">
+                          {Array.from({ length: STABILITY_THRESHOLD }).map((_, i) => (
+                            <span
+                              key={i}
+                              className={`h-1 flex-1 rounded-full transition-colors ${
+                                i < stabilityCount
+                                  ? locked
+                                    ? "bg-gold"
+                                    : "bg-primary"
+                                  : "bg-white/20"
+                              }`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Helper text */}
+                  <p className="text-center text-xs text-muted-foreground">
+                    {locked
+                      ? "Great! Your face shape is locked in. Confirm below or retry."
+                      : "Center your face inside the oval and hold still for a second."}
+                  </p>
+
+                  {/* Action row */}
+                  <div className="flex flex-wrap justify-center gap-2">
+                    <Button
+                      onClick={acceptLiveResult}
+                      disabled={!locked}
+                      className="min-w-[140px]"
+                    >
+                      <Check className="mr-2 h-4 w-4" />
+                      Use This Result
+                    </Button>
+                    <Button variant="outline" onClick={stopCamera}>
+                      <X className="mr-2 h-4 w-4" />
+                      Cancel
+                    </Button>
+                  </div>
                 </div>
               )}
 
@@ -291,7 +500,7 @@ export default function AIRecommendPage() {
                 }}
               />
 
-              {!cameraActive && !detecting && (
+              {cameraStatus === "idle" && !detecting && (
                 <div className="flex gap-3">
                   <Button
                     variant="outline"

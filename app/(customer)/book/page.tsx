@@ -115,6 +115,23 @@ function BookingPage() {
     const service = services.find((s) => s.id === selectedService);
     if (!service) return;
 
+    // Pre-flight: make sure this auth user has a matching public.users row.
+    // Accounts created before the signup trigger (migration 00002) won't,
+    // and bookings.customer_id -> users(id) would fail with a cryptic FK
+    // error. This gives a clear, actionable message instead.
+    const { data: profile } = await supabase
+      .from("users")
+      .select("id")
+      .eq("id", user.id)
+      .maybeSingle();
+    if (!profile) {
+      setError(
+        "Your profile isn't fully set up. Please contact support or ask an admin to run the backfill migration."
+      );
+      setSubmitting(false);
+      return;
+    }
+
     const startTime = new Date(`${selectedDate}T${selectedTime}:00`);
     const endTime = new Date(startTime.getTime() + service.duration_minutes * 60000);
 
@@ -129,9 +146,15 @@ function BookingPage() {
     });
 
     if (bookingError) {
-      setError(bookingError.message.includes("Double booking")
-        ? "This time slot was just taken. Please pick another."
-        : bookingError.message);
+      const msg = bookingError.message;
+      let friendly = msg;
+      if (msg.includes("Double booking")) {
+        friendly = "This time slot was just taken. Please pick another.";
+      } else if (msg.includes("bookings_customer_id_fkey")) {
+        friendly =
+          "Your account isn't linked to a customer profile yet. Ask an admin to run the latest migration, then try again.";
+      }
+      setError(friendly);
       setSubmitting(false);
       return;
     }
