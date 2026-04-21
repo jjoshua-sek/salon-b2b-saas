@@ -107,6 +107,24 @@ export default function AIRecommendPage() {
   // by start/stopCamera.
   const loopRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const historyRef = useRef<FaceShape[]>([]);
+  // Prevents overlapping estimateFaces() calls when a tick is still
+  // pending — without this, slow devices stack up promises and stall.
+  const isTickingRef = useRef(false);
+  // Offscreen canvas reused across ticks for brightness sampling. Creating
+  // it once and resizing it cheaply is much faster than spawning a fresh
+  // canvas every 450ms.
+  const sampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // How many frames in a row have returned zero faces. Used to escalate
+  // coaching hints from "looking for you" → "can't see you, try X".
+  const noFaceStreakRef = useRef(0);
+
+  // Live coaching message shown under the camera preview. Updated every
+  // tick based on: frame brightness, whether a face was found, and how
+  // well that face fills + centers in the oval.
+  const [liveHint, setLiveHint] = useState<string>("Starting camera…");
+  // After ~8s (18 ticks @ 450ms) of no face, show a prominent escape
+  // CTA — upload instead, or pick manually. Keeps the user unstuck.
+  const [showFallbackHelp, setShowFallbackHelp] = useState(false);
 
   const goTo = useCallback((s: Step) => startTransition(() => setStep(s)), [startTransition]);
 
@@ -164,9 +182,13 @@ export default function AIRecommendPage() {
       video.srcObject = null;
     }
     historyRef.current = [];
+    noFaceStreakRef.current = 0;
+    isTickingRef.current = false;
     setLiveShape(null);
     setStabilityCount(0);
     setLocked(false);
+    setShowFallbackHelp(false);
+    setLiveHint("Starting camera…");
     setCameraStatus("idle");
   }, []);
 
@@ -190,18 +212,131 @@ export default function AIRecommendPage() {
       const detector = await ensureDetector();
 
       setCameraStatus("running");
+      setLiveHint("Warming up detector…");
 
-      // Detection loop. Each tick: run estimateFaces on the current
-      // video frame, classify, push into the sliding history buffer,
-      // and update the stability count. Lock when STABILITY_THRESHOLD
-      // of the last STABILITY_WINDOW classifications agree.
+      // Detection loop. Each tick:
+      //   1. Sanity-check the video frame (ready, non-zero dimensions)
+      //   2. Sample frame brightness — if too dark, tell the user
+      //   3. Run estimateFaces; if empty, coach escalates with streak
+      //   4. If found, measure face size + position → coach accordingly
+      //   5. Classify + push into the stability window → lock when stable
+      // The isTickingRef guard prevents overlapping estimateFaces calls,
+      // which would otherwise queue up on slow machines and make the
+      // UI feel frozen.
       loopRef.current = setInterval(async () => {
-        const v = videoRef.current;
-        if (!v || v.readyState < 2) return;
+        if (isTickingRef.current) return;
+        isTickingRef.current = true;
 
         try {
+          const v = videoRef.current;
+          if (!v || v.readyState < 2 || v.videoWidth === 0) {
+            setLiveHint("Camera warming up…");
+            return;
+          }
+
+          // ── Brightness sample ─────────────────────────────────
+          // Draw a tiny version of the frame and average luminance.
+          // 32×24 is coarse enough to be cheap (<1ms) and accurate
+          // enough to detect a covered lens or a dark room.
+          const SAMPLE_W = 32;
+          const SAMPLE_H = 24;
+          let canvas = sampleCanvasRef.current;
+          if (!canvas) {
+            canvas = document.createElement("canvas");
+            canvas.width = SAMPLE_W;
+            canvas.height = SAMPLE_H;
+            sampleCanvasRef.current = canvas;
+          }
+          const ctx = canvas.getContext("2d", { willReadFrequently: true });
+          let avgLum = 255;
+          if (ctx) {
+            ctx.drawImage(v, 0, 0, SAMPLE_W, SAMPLE_H);
+            const { data } = ctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H);
+            let sum = 0;
+            for (let i = 0; i < data.length; i += 4) {
+              // Rec. 601 luma approximation — good enough for a
+              // "is there any light in the frame?" check.
+              sum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+            }
+            avgLum = sum / (SAMPLE_W * SAMPLE_H);
+          }
+          if (avgLum < 25) {
+            setLiveHint("It's quite dark — turn on a light or face a window.");
+            historyRef.current = [];
+            setLiveShape(null);
+            setStabilityCount(0);
+            setLocked(false);
+            noFaceStreakRef.current++;
+            if (noFaceStreakRef.current >= 18) setShowFallbackHelp(true);
+            return;
+          }
+
+          // ── Face estimation ──────────────────────────────────
           const faces = await detector.estimateFaces(v);
+
           if (faces.length === 0) {
+            noFaceStreakRef.current++;
+            historyRef.current = [];
+            setLiveShape(null);
+            setStabilityCount(0);
+            setLocked(false);
+            // Escalate the hint as frustration mounts.
+            if (noFaceStreakRef.current < 3) {
+              setLiveHint("Looking for your face — center it in the oval.");
+            } else if (noFaceStreakRef.current < 8) {
+              setLiveHint("Move closer and face the camera straight on.");
+            } else if (noFaceStreakRef.current < 14) {
+              setLiveHint("Try better lighting, remove glasses, or tie hair back.");
+            } else {
+              setLiveHint("Still can't see a face. Try a photo upload or pick manually below.");
+              setShowFallbackHelp(true);
+            }
+            return;
+          }
+
+          // Found a face — reset the frustration counter.
+          noFaceStreakRef.current = 0;
+          setShowFallbackHelp(false);
+
+          // ── Frame metrics ────────────────────────────────────
+          // Compute the face's bounding box to gauge whether the
+          // user is too far, too close, or off-center.
+          const kp = faces[0].keypoints;
+          let minX = Infinity;
+          let maxX = -Infinity;
+          let minY = Infinity;
+          let maxY = -Infinity;
+          for (const p of kp) {
+            if (p.x < minX) minX = p.x;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.y > maxY) maxY = p.y;
+          }
+          const vW = v.videoWidth;
+          const vH = v.videoHeight;
+          const faceArea = ((maxX - minX) * (maxY - minY)) / (vW * vH);
+          const cx = (minX + maxX) / 2 / vW;
+          const cy = (minY + maxY) / 2 / vH;
+
+          // Positioning is the strongest signal for the user — tell
+          // them that before worrying about classification quality.
+          let hint: string;
+          let goodFraming = false;
+          if (faceArea < 0.06) {
+            hint = "Move closer — fill the oval with your face.";
+          } else if (faceArea > 0.55) {
+            hint = "Move back a little — you're too close.";
+          } else if (cx < 0.3 || cx > 0.7 || cy < 0.3 || cy > 0.75) {
+            hint = "Re-center your face in the oval.";
+          } else {
+            hint = "Perfect — hold still for a moment.";
+            goodFraming = true;
+          }
+          setLiveHint(hint);
+
+          // Only feed well-framed frames into the classifier. Bad
+          // framing → bad ratios → flicker between shapes.
+          if (!goodFraming) {
             historyRef.current = [];
             setLiveShape(null);
             setStabilityCount(0);
@@ -209,7 +344,7 @@ export default function AIRecommendPage() {
             return;
           }
 
-          const landmarks = faces[0].keypoints.map((kp) => ({ x: kp.x, y: kp.y }));
+          const landmarks = kp.map((k) => ({ x: k.x, y: k.y }));
           const shape = classifyFaceShape(landmarks);
 
           historyRef.current.push(shape);
@@ -221,6 +356,8 @@ export default function AIRecommendPage() {
           setLocked(matching >= STABILITY_THRESHOLD);
         } catch {
           // swallow per-frame errors; the loop will recover on the next tick
+        } finally {
+          isTickingRef.current = false;
         }
       }, DETECT_INTERVAL_MS);
     } catch {
@@ -456,12 +593,60 @@ export default function AIRecommendPage() {
                     )}
                   </div>
 
-                  {/* Helper text */}
-                  <p className="text-center text-xs text-muted-foreground">
+                  {/* Helper text — drives directly off the detection
+                      loop's liveHint state so the message reflects
+                      what the model is actually seeing each tick. */}
+                  <p
+                    className={`text-center text-sm transition-colors ${
+                      locked
+                        ? "text-gold font-medium"
+                        : liveShape
+                          ? "text-primary"
+                          : "text-muted-foreground"
+                    }`}
+                  >
                     {locked
-                      ? "Great! Your face shape is locked in. Confirm below or retry."
-                      : "Center your face inside the oval and hold still for a second."}
+                      ? "Locked in — confirm below or retry."
+                      : liveHint}
                   </p>
+
+                  {/* Persistent-failure escape hatch. Shows after the
+                      loop has failed to find a face for ~8s. Links
+                      directly to the upload + manual pickers below. */}
+                  {showFallbackHelp && !locked && (
+                    <div className="rounded-md border border-gold/30 bg-gold/5 p-3 space-y-2">
+                      <p className="text-xs text-gold font-medium tracking-wider uppercase">
+                        Not detecting your face?
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        Try these in order: (1) move closer and face the camera,
+                        (2) turn on more light or face a window, (3) remove glasses
+                        or a mask, (4) tie hair back so your jawline is visible.
+                      </p>
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            stopCamera();
+                            fileInputRef.current?.click();
+                          }}
+                        >
+                          <Upload className="mr-2 h-3.5 w-3.5" />
+                          Upload a photo instead
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={stopCamera}
+                        >
+                          Pick manually
+                        </Button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Action row */}
                   <div className="flex flex-wrap justify-center gap-2">

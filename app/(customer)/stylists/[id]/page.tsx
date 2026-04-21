@@ -205,25 +205,17 @@ export default function StylistProfilePage() {
               </span>
             </div>
 
-            {/* Masonry-esque grid. We alternate aspect ratios so the gallery
-                doesn't read as a uniform grid of squares — it gives the
-                layout the rhythm you see in real editorial portfolios. */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {rest.length > 0
-                ? rest.map((item, i) => (
-                    <PortfolioCard
-                      key={item.id}
-                      item={item}
-                      aspect={i % 3 === 0 ? "aspect-[3/4]" : "aspect-square"}
-                    />
-                  ))
-                : portfolio.map((item, i) => (
-                    <PortfolioCard
-                      key={item.id}
-                      item={item}
-                      aspect={i % 3 === 0 ? "aspect-[3/4]" : "aspect-square"}
-                    />
-                  ))}
+            {/* True masonry via CSS multi-column layout. Columns have a
+                uniform width (1/2/3 depending on breakpoint) but each
+                tile keeps the image's natural aspect ratio — so rows
+                never line up. That's the "messy but uniform" feel you
+                get on real editorial portfolios (Cargo, Behance, etc.)
+                with none of the black letterbox bars that forced-aspect
+                containers create when the image doesn't match the crop. */}
+            <div className="columns-1 sm:columns-2 lg:columns-3 gap-4 [column-fill:_balance]">
+              {(rest.length > 0 ? rest : portfolio).map((item) => (
+                <PortfolioCard key={item.id} item={item} />
+              ))}
             </div>
           </section>
         )}
@@ -271,41 +263,47 @@ export default function StylistProfilePage() {
 }
 
 /**
- * A single portfolio tile. Extracted so the hover treatment is defined
- * once and the main render stays readable.
+ * A single portfolio tile. Uses a plain <img> so the browser can size
+ * the element from the image's intrinsic dimensions — that's what lets
+ * the masonry column layout work without cropping. We pay with losing
+ * next/image's optimization pipeline, but the source files are already
+ * AVIF and small enough that the trade-off is worth the layout fidelity.
+ *
+ * mb-4 + break-inside-avoid are the two rules that make CSS columns
+ * behave like masonry: each tile reserves its full height in the column
+ * flow and doesn't split across columns mid-image.
  */
-function PortfolioCard({ item, aspect }: { item: PortfolioRow; aspect: string }) {
+function PortfolioCard({ item }: { item: PortfolioRow }) {
   return (
-    <div className="group relative overflow-hidden rounded-md border border-[#2a2520] bg-[#141414]">
-      <div className={`relative ${aspect} w-full`}>
-        <Image
-          src={item.image_url}
-          alt={item.title ?? "Portfolio piece"}
-          fill
-          sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
-          className="object-cover transition-transform duration-500 group-hover:scale-105"
-        />
-        {/* Caption overlay that fades in on hover — keeps the grid clean
-            at rest while still providing context on demand. */}
-        <div className="absolute inset-0 bg-gradient-to-t from-[#0a0a0a] via-[#0a0a0a]/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
-        <div className="absolute inset-x-0 bottom-0 p-4 translate-y-2 group-hover:translate-y-0 opacity-0 group-hover:opacity-100 transition-all duration-300">
-          {item.title && (
-            <p className="font-medium text-sm text-white">{item.title}</p>
-          )}
-          {item.tags && item.tags.length > 0 && (
-            <div className="flex flex-wrap gap-1 mt-1.5">
-              {item.tags.slice(0, 3).map((tag) => (
-                <Badge
-                  key={tag}
-                  variant="outline"
-                  className="text-[10px] border-gold/40 text-gold capitalize"
-                >
-                  {tag}
-                </Badge>
-              ))}
-            </div>
-          )}
-        </div>
+    <div className="group relative mb-4 break-inside-avoid overflow-hidden rounded-md border border-[#2a2520] bg-[#141414]">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={item.image_url}
+        alt={item.title ?? "Portfolio piece"}
+        loading="lazy"
+        className="block h-auto w-full transition-transform duration-500 group-hover:scale-[1.02]"
+      />
+      {/* Caption overlay — fades in on hover so the grid reads as pure
+          imagery at rest, with context on demand. pointer-events-none so
+          the overlay never absorbs clicks meant for the hover target. */}
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#0a0a0a] via-[#0a0a0a]/60 to-transparent opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
+      <div className="absolute inset-x-0 bottom-0 translate-y-2 p-4 opacity-0 transition-all duration-300 group-hover:translate-y-0 group-hover:opacity-100">
+        {item.title && (
+          <p className="text-sm font-medium text-white">{item.title}</p>
+        )}
+        {item.tags && item.tags.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {item.tags.slice(0, 3).map((tag) => (
+              <Badge
+                key={tag}
+                variant="outline"
+                className="border-gold/40 text-gold text-[10px] capitalize"
+              >
+                {tag}
+              </Badge>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
