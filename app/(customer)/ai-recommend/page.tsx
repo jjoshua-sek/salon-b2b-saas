@@ -25,18 +25,44 @@ import {
   type FaceShape,
 } from "@/lib/ai/face-shape";
 
-// Lazy-loaded face detector. TF.js + MediaPipe weights are ~20 MB, so
-// load on demand and cache in a ref — the same instance handles both
-// the one-shot upload flow and the continuous live-camera flow.
+// Lazy-loaded face detector. Weights (~5-10 MB) load on demand and
+// are cached in a ref — the same instance handles both the one-shot
+// upload flow and the continuous live-camera flow.
+//
+// We prefer the `mediapipe` runtime (Google's official WASM build
+// via @mediapipe/face_mesh) because the `tfjs` port relies on WebGL
+// and silently falls back to CPU on some GPUs — which is the root
+// cause of "it never detects my face." If the WASM bundle fails to
+// load (CSP / offline / exotic browser), we fall back to tfjs so
+// the feature degrades instead of breaking outright.
 async function createFaceDetector() {
-  const tf = await import("@tensorflow/tfjs");
-  await tf.ready();
   const fld = await import("@tensorflow-models/face-landmarks-detection");
-  return fld.createDetector(fld.SupportedModels.MediaPipeFaceMesh, {
-    runtime: "tfjs",
-    refineLandmarks: true,
-    maxFaces: 1,
-  });
+  try {
+    return await fld.createDetector(fld.SupportedModels.MediaPipeFaceMesh, {
+      runtime: "mediapipe",
+      // refineLandmarks adds iris keypoints (478 vs 468). We only need
+      // the face contour for classification, so skip it — faster init
+      // and fewer failure modes.
+      refineLandmarks: false,
+      maxFaces: 1,
+      // Version-pinned CDN path matches the @mediapipe/face_mesh in
+      // package.json. If you upgrade that dep, bump this string too.
+      solutionPath:
+        "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619",
+    });
+  } catch (mpError) {
+    console.warn(
+      "[face-mesh] mediapipe runtime init failed, falling back to tfjs:",
+      mpError,
+    );
+    const tf = await import("@tensorflow/tfjs");
+    await tf.ready();
+    return fld.createDetector(fld.SupportedModels.MediaPipeFaceMesh, {
+      runtime: "tfjs",
+      refineLandmarks: false,
+      maxFaces: 1,
+    });
+  }
 }
 type FaceDetector = Awaited<ReturnType<typeof createFaceDetector>>;
 
@@ -262,10 +288,8 @@ export default function AIRecommendPage() {
           }
           if (avgLum < 25) {
             setLiveHint("It's quite dark — turn on a light or face a window.");
-            historyRef.current = [];
-            setLiveShape(null);
-            setStabilityCount(0);
-            setLocked(false);
+            // Don't wipe history on transient misses. A single dark frame
+            // shouldn't undo a half-built stability window.
             noFaceStreakRef.current++;
             if (noFaceStreakRef.current >= 18) setShowFallbackHelp(true);
             return;
@@ -276,10 +300,15 @@ export default function AIRecommendPage() {
 
           if (faces.length === 0) {
             noFaceStreakRef.current++;
-            historyRef.current = [];
-            setLiveShape(null);
-            setStabilityCount(0);
-            setLocked(false);
+            // Keep the stability history: a single missed frame shouldn't
+            // invalidate the last four good classifications. Only reset
+            // after a sustained streak suggests the user has left frame.
+            if (noFaceStreakRef.current >= 4) {
+              historyRef.current = [];
+              setLiveShape(null);
+              setStabilityCount(0);
+              setLocked(false);
+            }
             // Escalate the hint as frustration mounts.
             if (noFaceStreakRef.current < 3) {
               setLiveHint("Looking for your face — center it in the oval.");
@@ -288,7 +317,7 @@ export default function AIRecommendPage() {
             } else if (noFaceStreakRef.current < 14) {
               setLiveHint("Try better lighting, remove glasses, or tie hair back.");
             } else {
-              setLiveHint("Still can't see a face. Try a photo upload or pick manually below.");
+              setLiveHint("Still can't see a face. Pick another method below.");
               setShowFallbackHelp(true);
             }
             return;
@@ -320,29 +349,31 @@ export default function AIRecommendPage() {
 
           // Positioning is the strongest signal for the user — tell
           // them that before worrying about classification quality.
+          // Thresholds are deliberately generous so the user isn't
+          // fighting the oval — "in frame and reasonably centered" is
+          // plenty for FaceMesh to produce stable ratios.
           let hint: string;
           let goodFraming = false;
-          if (faceArea < 0.06) {
+          if (faceArea < 0.035) {
             hint = "Move closer — fill the oval with your face.";
-          } else if (faceArea > 0.55) {
+          } else if (faceArea > 0.65) {
             hint = "Move back a little — you're too close.";
-          } else if (cx < 0.3 || cx > 0.7 || cy < 0.3 || cy > 0.75) {
+          } else if (cx < 0.2 || cx > 0.8 || cy < 0.2 || cy > 0.8) {
             hint = "Re-center your face in the oval.";
           } else {
-            hint = "Perfect — hold still for a moment.";
+            hint = locked
+              ? "Locked in — confirm below."
+              : "Looking good — hold still.";
             goodFraming = true;
           }
           setLiveHint(hint);
 
-          // Only feed well-framed frames into the classifier. Bad
-          // framing → bad ratios → flicker between shapes.
-          if (!goodFraming) {
-            historyRef.current = [];
-            setLiveShape(null);
-            setStabilityCount(0);
-            setLocked(false);
-            return;
-          }
+          // Only feed well-framed frames into the classifier; bad
+          // framing produces noisy ratios and makes the shape flicker.
+          // But DO keep the existing history — a single off-frame
+          // shouldn't undo progress. The history decays naturally as
+          // the sliding window slides.
+          if (!goodFraming) return;
 
           const landmarks = kp.map((k) => ({ x: k.x, y: k.y }));
           const shape = classifyFaceShape(landmarks);
@@ -610,41 +641,81 @@ export default function AIRecommendPage() {
                       : liveHint}
                   </p>
 
-                  {/* Persistent-failure escape hatch. Shows after the
-                      loop has failed to find a face for ~8s. Links
-                      directly to the upload + manual pickers below. */}
-                  {showFallbackHelp && !locked && (
-                    <div className="rounded-md border border-gold/30 bg-gold/5 p-3 space-y-2">
-                      <p className="text-xs text-gold font-medium tracking-wider uppercase">
-                        Not detecting your face?
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        Try these in order: (1) move closer and face the camera,
-                        (2) turn on more light or face a window, (3) remove glasses
-                        or a mask, (4) tie hair back so your jawline is visible.
-                      </p>
-                      <div className="flex flex-wrap gap-2 pt-1">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            stopCamera();
-                            fileInputRef.current?.click();
-                          }}
-                        >
-                          <Upload className="mr-2 h-3.5 w-3.5" />
-                          Upload a photo instead
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          onClick={stopCamera}
-                        >
-                          Pick manually
-                        </Button>
-                      </div>
+                  {/* Always-visible "having trouble?" row. Gives the user
+                      an explicit exit without having to wait for the 8s
+                      timeout. When showFallbackHelp is true (auto-raised
+                      after ~8s with no face, OR toggled manually), the
+                      expanded panel with three equal choices renders. */}
+                  {!locked && (
+                    <div className="space-y-2">
+                      {!showFallbackHelp && (
+                        <div className="text-center">
+                          <button
+                            type="button"
+                            onClick={() => setShowFallbackHelp(true)}
+                            className="text-xs text-muted-foreground underline-offset-4 hover:text-gold hover:underline"
+                          >
+                            Having trouble? Pick another method →
+                          </button>
+                        </div>
+                      )}
+
+                      {showFallbackHelp && (
+                        <div className="space-y-3 rounded-md border border-gold/30 bg-gold/5 p-4">
+                          <div className="space-y-1">
+                            <p className="text-xs font-semibold uppercase tracking-wider text-gold">
+                              Choose how to continue
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              Improve detection: face a light source, move so
+                              your face fills the oval, remove glasses, tie
+                              hair back so your jawline is visible.
+                            </p>
+                          </div>
+                          {/* Three equal-priority options. We present them
+                              side-by-side so the user is never forced into
+                              one path — retry is just as first-class as
+                              upload or manual pick. */}
+                          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                // Soft-reset the streak and hint so the
+                                // loop gets a fresh attempt without
+                                // restarting the camera stream.
+                                noFaceStreakRef.current = 0;
+                                setShowFallbackHelp(false);
+                                setLiveHint("Retrying — look at the camera.");
+                              }}
+                            >
+                              <Camera className="mr-2 h-3.5 w-3.5" />
+                              Retry camera
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                stopCamera();
+                                fileInputRef.current?.click();
+                              }}
+                            >
+                              <Upload className="mr-2 h-3.5 w-3.5" />
+                              Upload photo
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={stopCamera}
+                            >
+                              Pick manually
+                            </Button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
 
