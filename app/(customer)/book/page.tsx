@@ -63,8 +63,20 @@ function BookingPage() {
       setStylists((stylistsRes.data as unknown as StylistOption[]) ?? []);
       setLoading(false);
 
-      if (preselectedService) startTransition(() => setStep(2));
-      if (preselectedStylist) startTransition(() => setStep(preselectedService ? 3 : 2));
+      // Deep-link handling. The golden rule is that a service MUST be
+      // chosen before confirm, otherwise the price comes out as ₱0 and
+      // the FK on service_id fails. So:
+      //   - Both preselected: jump straight to date/time (step 3).
+      //   - Only service:     jump to stylist pick (step 2).
+      //   - Only stylist:     START at service pick (step 1) — we'll
+      //                       auto-skip step 2 once the user picks a
+      //                       service, since the stylist is already set.
+      //   - Neither:          step 1.
+      if (preselectedService && preselectedStylist) {
+        startTransition(() => setStep(3));
+      } else if (preselectedService) {
+        startTransition(() => setStep(2));
+      }
     }
     fetchData();
   }, [preselectedService, preselectedStylist]);
@@ -220,7 +232,15 @@ function BookingPage() {
             {services.map((service) => (
               <button
                 key={service.id}
-                onClick={() => { setSelectedService(service.id); startTransition(() => setStep(2)); }}
+                onClick={() => {
+                  setSelectedService(service.id);
+                  // If a stylist was already locked in via the deep-link
+                  // (e.g. /book?stylist=<id>), skip the stylist-picker
+                  // step and go straight to date/time.
+                  startTransition(() =>
+                    setStep(preselectedStylist ? 3 : 2),
+                  );
+                }}
                 className={`w-full text-left p-3 rounded-md border transition-colors ${
                   selectedService === service.id ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"
                 }`}
@@ -275,7 +295,17 @@ function BookingPage() {
         <Card>
           <CardHeader>
             <CardTitle>Pick Date & Time</CardTitle>
-            <Button variant="ghost" size="sm" onClick={() => startTransition(() => setStep(2))}>← Back</Button>
+            {/* Back respects the preselected-stylist fast-path: if step 2
+                was skipped on the way forward, skip it on the way back too. */}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                startTransition(() => setStep(preselectedStylist ? 1 : 2))
+              }
+            >
+              ← Back
+            </Button>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">

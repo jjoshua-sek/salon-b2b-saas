@@ -158,6 +158,63 @@ const SAMPLE_SERVICES = [
   },
 ];
 
+// --- 4b. portfolio gallery -------------------------------------------------
+// Images live in `public/nissi-portfolio/` so they're served straight off
+// Vercel's CDN with no Supabase Storage round-trip. Titles/tags are
+// authored to read like a real portfolio caption.
+const PORTFOLIO_ITEMS = [
+  {
+    image_url: "/nissi-portfolio/1731855637-908487-westlight-34.avif",
+    title: "Westlight Editorial",
+    description:
+      "Dimensional blonde with a lived-in root. Shot for Westlight's Fall campaign.",
+    tags: ["balayage", "editorial", "blonde"],
+  },
+  {
+    image_url: "/nissi-portfolio/1731856248-382702-bergman-02-img-9520p-copy.avif",
+    title: "Bergman Studio — Signature Blowout",
+    description:
+      "The Booji Blowout on natural texture — soft volume, airy ends.",
+    tags: ["blowout", "styling", "signature"],
+  },
+  {
+    image_url: "/nissi-portfolio/1731855827-592086-chloeandsage-anthonyromano-46-sm.avif",
+    title: "Chloe & Sage Campaign",
+    description:
+      "Sun-kissed balayage tailored for a soft, low-maintenance grow-out.",
+    tags: ["balayage", "color", "campaign"],
+  },
+  {
+    image_url: "/nissi-portfolio/1633039843-377914-anthonyromano-teck-sbd-001.avif",
+    title: "Studio Portrait — Custom Color",
+    description:
+      "Hand-painted highlights with a shadow root for depth and shine.",
+    tags: ["color", "editorial"],
+  },
+  {
+    image_url: "/nissi-portfolio/1731855671-479459-anthonyromano-teck-wbd-003.avif",
+    title: "Extension Application — Seamless Install",
+    description:
+      "Full-service extension application blended to match natural texture and movement.",
+    tags: ["extensions", "install"],
+  },
+];
+
+async function ensurePortfolio(stylistId) {
+  // Replace the whole portfolio for this stylist so edits to titles/tags
+  // above get picked up on re-run without leaving orphan rows.
+  const { error: delError } = await sb
+    .from("portfolio_items")
+    .delete()
+    .eq("stylist_id", stylistId);
+  if (delError) throw new Error(`clear portfolio: ${delError.message}`);
+
+  const rows = PORTFOLIO_ITEMS.map((item) => ({ ...item, stylist_id: stylistId }));
+  const { error } = await sb.from("portfolio_items").insert(rows);
+  if (error) throw new Error(`insert portfolio: ${error.message}`);
+  console.log(`[4b/5] portfolio seeded: ${rows.length} items`);
+}
+
 async function ensureServices() {
   for (const svc of SAMPLE_SERVICES) {
     const { data: existing } = await sb
@@ -184,7 +241,8 @@ async function ensureServices() {
 try {
   const userId = await ensureStylistUser();
   await ensureProfileRow(userId);
-  await ensureStylistRow(userId);
+  const stylistId = await ensureStylistRow(userId);
+  await ensurePortfolio(stylistId);
   await ensureServices();
   console.log("\n✓ Seed complete.");
   console.log(`  Stylist login: ${STYLIST_EMAIL} / ${STYLIST_PASSWORD}`);

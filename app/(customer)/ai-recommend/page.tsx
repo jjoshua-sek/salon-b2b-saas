@@ -356,12 +356,17 @@ export default function AIRecommendPage() {
               {cameraStatus !== "idle" && (
                 <div className="space-y-3">
                   <div className="relative mx-auto w-full max-w-md aspect-[4/3] overflow-hidden rounded-lg border border-border bg-black">
+                    {/* scale-x-[-1] mirrors the video like a bathroom mirror,
+                        so the user's movements match what they'd expect. The
+                        detector reads raw pixel data, so face-shape ratios
+                        are rotation/reflection invariant — classification is
+                        unaffected. */}
                     <video
                       ref={videoRef}
                       autoPlay
                       playsInline
                       muted
-                      className="h-full w-full object-cover"
+                      className="h-full w-full object-cover scale-x-[-1]"
                     />
 
                     {/* Center alignment guide — a faint oval the user
