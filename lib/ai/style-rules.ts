@@ -127,6 +127,13 @@ const RULES: Record<FaceShape, FaceShapeRules> = {
 
 /**
  * Adjusts base recommendations based on hair type, desired length, and style vibe.
+ *
+ * Tips are returned split into two buckets:
+ *   - `tips`:     face-shape-driven advice that applies regardless of texture
+ *   - `hairTips`: hair-type-specific advice (curl cutting, texturizing, etc.)
+ *
+ * Keeping them separate lets the UI render them in distinct sections so the
+ * user *sees* that their hair-type answer was taken into account.
  */
 export function getRecommendations(
   faceShape: FaceShape,
@@ -134,6 +141,7 @@ export function getRecommendations(
 ): {
   styles: StyleRecommendation[];
   tips: string[];
+  hairTips: string[];
   avoid: string[];
 } {
   const rules = RULES[faceShape];
@@ -148,9 +156,15 @@ export function getRecommendations(
     if (preferences.desiredLength === "medium" && style.tags.some((t) => ["lob", "medium", "chin-length"].includes(t))) bonus += 5;
     if (preferences.desiredLength === "long" && style.tags.some((t) => ["long", "layers"].includes(t))) bonus += 5;
 
-    // Hair type alignment
-    if (preferences.hairType === "curly" && style.tags.some((t) => ["waves", "textured", "volume"].includes(t))) bonus += 3;
-    if (preferences.hairType === "straight" && style.tags.some((t) => ["sleek", "blunt", "classic"].includes(t))) bonus += 3;
+    // Hair type alignment — tag lists are kept in sync with the
+    // HAIR_TAG_MATCH map on the client so the "Great for {type} hair"
+    // chip only shows when the scorer actually rewarded that tag.
+    if ((preferences.hairType === "curly" || preferences.hairType === "coily") &&
+        style.tags.some((t) => ["waves", "textured", "volume"].includes(t))) bonus += 3;
+    if (preferences.hairType === "straight" &&
+        style.tags.some((t) => ["sleek", "blunt", "classic"].includes(t))) bonus += 3;
+    if (preferences.hairType === "wavy" &&
+        style.tags.some((t) => ["waves", "soft", "natural"].includes(t))) bonus += 3;
 
     // Style vibe alignment
     if (preferences.styleVibe === "bold" && style.tags.some((t) => ["pixie", "angular", "asymmetric"].includes(t))) bonus += 4;
@@ -164,18 +178,33 @@ export function getRecommendations(
   // Sort by match score
   styles.sort((a, b) => b.matchScore - a.matchScore);
 
-  // Add hair-type-specific tips
-  const tips = [...rules.tips];
+  // Hair-type-specific tips — returned separately so the UI can give
+  // them their own visual callout instead of burying them at the end
+  // of a generic list.
+  const hairTips: string[] = [];
   if (preferences.hairType === "curly" || preferences.hairType === "coily") {
-    tips.push("Ask your stylist about curl-specific cutting techniques for maximum definition");
+    hairTips.push(
+      "Ask your stylist about curl-specific cutting techniques (Deva / Rezo / Ouidad) for maximum definition.",
+    );
+    hairTips.push(
+      "Look for stylists whose portfolio shows textured work — a generalist cut often disrupts curl patterns.",
+    );
+  }
+  if (preferences.hairType === "wavy") {
+    hairTips.push(
+      "Long layers enhance natural wave patterns. Avoid heavy blunt cuts that weigh waves down.",
+    );
   }
   if (preferences.hairType === "straight") {
-    tips.push("Texturizing techniques can add movement and body to straight hair");
+    hairTips.push(
+      "Texturizing techniques (point-cutting, slide-cutting) add movement and body to straight hair.",
+    );
   }
 
   return {
     styles,
-    tips,
+    tips: [...rules.tips],
+    hairTips,
     avoid: rules.avoid,
   };
 }

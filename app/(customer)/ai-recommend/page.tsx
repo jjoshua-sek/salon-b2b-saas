@@ -24,6 +24,14 @@ import {
   classifyFaceShape,
   type FaceShape,
 } from "@/lib/ai/face-shape";
+import { HairTypeIcon } from "@/components/ui/hair-type-icon";
+import type {
+  HairType,
+  DesiredLength,
+  StyleVibe,
+  StyleRecommendation,
+} from "@/lib/ai/style-rules";
+import type { Service } from "@/types/database";
 // Types come via `import type` (erased at build time — no bundler cost)
 // so the runtime import can stay dynamic and load the WASM on demand.
 import type {
@@ -35,15 +43,35 @@ import type {
 // Landmark point in frame coordinates (pixels, not normalized).
 type Landmark = { x: number; y: number };
 
-// Uniform detector interface: give it a video/image, get back an
-// array of absolute-pixel landmarks (or null if no face was found).
-// Callers don't need to care which underlying engine is in use.
+// Uniform detector interface: give it a video/image/canvas, get back
+// an array of absolute-pixel landmarks (or null if no face was found).
+// Accepting canvases lets the upload path feed pre-resized bitmaps —
+// FaceMesh is happier with 1280px than with a raw 4K phone photo.
+type DetectSource =
+  | HTMLVideoElement
+  | HTMLImageElement
+  | HTMLCanvasElement;
 type FaceDetector = {
   runtime: "mediapipe-direct" | "tfjs";
-  detect: (
-    source: HTMLVideoElement | HTMLImageElement,
-  ) => Promise<Landmark[] | null>;
+  detect: (source: DetectSource) => Promise<Landmark[] | null>;
 };
+
+/**
+ * Extract pixel dimensions from any of the three valid sources.
+ * Videos expose dimensions via `videoWidth`/`videoHeight`; images and
+ * canvases both use `width`/`height`, but on an `<img>` those reflect
+ * the intrinsic (natural) size unless CSS has constrained it, so
+ * `naturalWidth`/`naturalHeight` is the reliable choice for images.
+ */
+function sourceDimensions(source: DetectSource): { w: number; h: number } {
+  if (source instanceof HTMLVideoElement) {
+    return { w: source.videoWidth, h: source.videoHeight };
+  }
+  if (source instanceof HTMLImageElement) {
+    return { w: source.naturalWidth, h: source.naturalHeight };
+  }
+  return { w: source.width, h: source.height };
+}
 
 // Primary path: use @mediapipe/face_mesh DIRECTLY. This is the exact
 // C++ runtime Google ships in Meet, compiled to WASM. Going around the
@@ -98,12 +126,7 @@ async function createFaceDetector(): Promise<FaceDetector> {
         if (!snap) return null;
         const lists = snap.multiFaceLandmarks;
         if (!lists || lists.length === 0) return null;
-        const w =
-          source instanceof HTMLVideoElement ? source.videoWidth : source.width;
-        const h =
-          source instanceof HTMLVideoElement
-            ? source.videoHeight
-            : source.height;
+        const { w, h } = sourceDimensions(source);
         // MediaPipe returns normalized [0,1] coords — expand to pixels
         // so downstream shape classification (which uses pixel ratios)
         // gets the right input.
@@ -139,20 +162,93 @@ async function createFaceDetector(): Promise<FaceDetector> {
 const DETECT_INTERVAL_MS = 450;   // ~2 FPS; enough to feel live, light on CPU
 const STABILITY_WINDOW = 5;       // last N classifications kept
 const STABILITY_THRESHOLD = 3;    // this many agreeing classifications -> lock
-import type {
-  HairType,
-  DesiredLength,
-  StyleVibe,
-  StyleRecommendation,
-} from "@/lib/ai/style-rules";
-import type { Service } from "@/types/database";
+
+// Hair-type picker options — declared at module scope so the array is
+// referentially stable across renders. Captions are deliberately short
+// (visual + word combined should land in <4 seconds of reading).
+const HAIR_TYPE_OPTIONS: { type: HairType; caption: string }[] = [
+  { type: "straight", caption: "Smooth, no curl" },
+  { type: "wavy", caption: "Loose S-shapes" },
+  { type: "curly", caption: "Defined curls" },
+  { type: "coily", caption: "Tight coils" },
+];
+
+/**
+ * Which tag keywords earn a hair-type bonus inside the recommendation
+ * engine. Kept in sync with style-rules.ts's scoring — see the
+ * "Hair type alignment" branch there. If these drift, we'll be showing
+ * a "Great for curly hair" chip when the scorer didn't actually reward
+ * it. Left as two arrays (not a Set keyed on hair type) because we
+ * only have tags for curly and straight today; wavy/coily inherit
+ * from the closest neighbor in the spectrum.
+ */
+const HAIR_TAG_MATCH: Record<HairType, string[]> = {
+  // Curly & coily both benefit from textured/voluminous cuts.
+  curly: ["waves", "textured", "volume"],
+  coily: ["waves", "textured", "volume"],
+  // Straight hair looks best with tags that emphasize sleekness.
+  straight: ["sleek", "blunt", "classic"],
+  // Wavy is in the middle — borrow from both without double-counting.
+  wavy: ["waves", "soft", "natural"],
+};
+
+function styleMatchesHairType(tags: string[], hairType: HairType): boolean {
+  const needles = HAIR_TAG_MATCH[hairType];
+  return tags.some((t) => needles.includes(t));
+}
+
+/**
+ * Downscale an oversized image onto a canvas and return the canvas as
+ * the detection source. FaceMesh is tuned for ~192px square input and
+ * handles 640–1280px very well; feeding it a raw 4K phone photo often
+ * *hurts* accuracy because details get aliased by the model's internal
+ * resize. Images already within the cap are returned as-is.
+ *
+ * Returns the original <img> or an HTMLCanvasElement — FaceMesh accepts
+ * both through the same `send({ image })` signature.
+ */
+async function resizeForDetection(
+  img: HTMLImageElement,
+  maxDim: number,
+): Promise<HTMLImageElement | HTMLCanvasElement> {
+  const { naturalWidth: w, naturalHeight: h } = img;
+  const longest = Math.max(w, h);
+  if (longest <= maxDim) return img;
+
+  const scale = maxDim / longest;
+  const targetW = Math.round(w * scale);
+  const targetH = Math.round(h * scale);
+  const canvas = document.createElement("canvas");
+  canvas.width = targetW;
+  canvas.height = targetH;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return img; // canvas unsupported somehow — fall back to original
+  // imageSmoothingQuality "high" gives better downscale results on
+  // photographic content than the default "low".
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, 0, 0, targetW, targetH);
+  return canvas;
+}
 
 type Step = "detect" | "preferences" | "results";
 
 interface RecommendationResult {
   faceShape: FaceShape;
+  // Echo the preferences that drove the recommendations back into the
+  // result. This lets the UI show the user *why* these styles were
+  // picked — "based on your curly hair + bold vibe" — instead of
+  // presenting the recommendations as if they came from nowhere.
+  preferences: {
+    hairType: HairType;
+    desiredLength: DesiredLength;
+    styleVibe: StyleVibe;
+  };
   styles: StyleRecommendation[];
   tips: string[];
+  // Hair-type-specific styling advice. Split from `tips` so we can
+  // give it its own visual callout in the results view.
+  hairTips: string[];
   avoid: string[];
   services: Service[];
   portfolio: { id: string; image_url: string; title: string | null; tags: string[] | null; stylist: { id: string; user: { full_name: string } | null } | null }[];
@@ -252,30 +348,68 @@ export default function AIRecommendPage() {
   const goTo = useCallback((s: Step) => startTransition(() => setStep(s)), [startTransition]);
 
   // ── Photo Upload Handler ──
+  // Modern phone cameras routinely produce 4032×3024 images. FaceMesh
+  // internally downsamples to 192×192 for inference, so feeding it a
+  // huge image doesn't help — and fine details can actually alias badly
+  // through that chain. Pre-resizing on our side to a known-good size
+  // gives the model cleaner input and also halves the detection latency
+  // on low-end laptops. 1280px was picked as the point where no visible
+  // detail is lost but inference runs smoothly.
+  const MAX_DETECT_DIMENSION = 1280;
   const handlePhotoUpload = useCallback(async (file: File) => {
     setDetectionError("");
     setDetecting(true);
 
-    // Show preview
+    // Show preview (independent of the detection pipeline — the user
+    // should always see what they uploaded even if detection fails).
     const reader = new FileReader();
     reader.onload = (e) => setPhotoPreview(e.target?.result as string);
     reader.readAsDataURL(file);
 
+    const objectUrl = URL.createObjectURL(file);
     try {
       const detector = await ensureDetector();
 
-      // Create image element from file
+      // Load the image. `decode()` beats the classic onload/onerror
+      // dance — it returns a single promise that rejects cleanly on
+      // corrupt files and resolves only when the image is decoded
+      // enough to paint. Some older browsers lack decode(), so we fall
+      // back to onload with a 10s timeout.
       const img = new Image();
-      img.src = URL.createObjectURL(file);
-      await new Promise<void>((resolve) => {
-        img.onload = () => resolve();
-      });
+      img.src = objectUrl;
+      if (typeof img.decode === "function") {
+        await img.decode();
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error("image load timeout")),
+            10_000,
+          );
+          img.onload = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          img.onerror = () => {
+            clearTimeout(timer);
+            reject(new Error("image load error"));
+          };
+        });
+      }
 
-      const landmarks = await detector.detect(img);
-      URL.revokeObjectURL(img.src);
+      if (!img.naturalWidth || !img.naturalHeight) {
+        throw new Error("image has zero dimensions");
+      }
+
+      // Downscale oversized images to improve FaceMesh accuracy. We
+      // detect against the resized source (a canvas drawn at the
+      // capped dimensions) rather than the original <img>.
+      const detectSource = await resizeForDetection(img, MAX_DETECT_DIMENSION);
+      const landmarks = await detector.detect(detectSource);
 
       if (!landmarks) {
-        setDetectionError("No face detected. Please try a clearer photo or select manually below.");
+        setDetectionError(
+          "No face detected. Try a well-lit front-facing photo where your whole face is visible, or pick your shape manually below.",
+        );
         setDetecting(false);
         return;
       }
@@ -284,9 +418,17 @@ export default function AIRecommendPage() {
       setFaceShape(shape);
       setDetecting(false);
       goTo("preferences");
-    } catch {
-      setDetectionError("Face detection failed. Please select your face shape manually.");
+    } catch (err) {
+      // Log for devs; keep the user-facing copy actionable.
+      if (process.env.NODE_ENV !== "production") {
+        console.error("[ai-recommend] photo upload detection failed:", err);
+      }
+      setDetectionError(
+        "Couldn't process that photo. Try another image or pick your face shape manually.",
+      );
       setDetecting(false);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
     }
   }, [goTo, ensureDetector]);
 
@@ -382,14 +524,13 @@ export default function AIRecommendPage() {
             }
             avgLum = sum / (SAMPLE_W * SAMPLE_H);
           }
-          if (avgLum < 25) {
-            setLiveHint("It's quite dark — turn on a light or face a window.");
-            // Don't wipe history on transient misses. A single dark frame
-            // shouldn't undo a half-built stability window.
-            noFaceStreakRef.current++;
-            if (noFaceStreakRef.current >= 18) setShowFallbackHelp(true);
-            return;
-          }
+          // Brightness is *advisory*, not a gate. Previously we
+          // returned early whenever avgLum < 25, but FaceMesh frequently
+          // succeeds in dim rooms that our coarse 32×24 sample would
+          // have written off. We still remember that the frame was
+          // dark so we can surface a contextual hint if detection
+          // happens to miss — but we always give the detector a shot.
+          const frameIsDark = avgLum < 25;
 
           // ── Face estimation ──────────────────────────────────
           const landmarks = await detector.detect(v);
@@ -416,8 +557,18 @@ export default function AIRecommendPage() {
               setStabilityCount(0);
               setLocked(false);
             }
-            // Escalate the hint as frustration mounts.
-            if (noFaceStreakRef.current < 3) {
+            // Escalate the hint as frustration mounts. If the frame
+            // was measurably dark, promote the lighting tip earlier —
+            // that's usually the most actionable thing the user can
+            // do when detection isn't finding them.
+            if (frameIsDark) {
+              setLiveHint(
+                noFaceStreakRef.current >= 14
+                  ? "Still can't see a face — pick another method below."
+                  : "It's quite dark — turn on a light or face a window.",
+              );
+              if (noFaceStreakRef.current >= 14) setShowFallbackHelp(true);
+            } else if (noFaceStreakRef.current < 3) {
               setLiveHint("Looking for your face — center it in the oval.");
             } else if (noFaceStreakRef.current < 8) {
               setLiveHint("Move closer and face the camera straight on.");
@@ -549,7 +700,13 @@ export default function AIRecommendPage() {
 
     if (res.ok) {
       const data = await res.json();
-      setResult(data);
+      // Echo the preferences the user just confirmed onto the result.
+      // The API route doesn't need to know about this field — it's
+      // purely for the results UI to show "here's what shaped this".
+      setResult({
+        ...data,
+        preferences: { hairType, desiredLength, styleVibe },
+      });
       goTo("results");
     }
     setLoading(false);
@@ -991,21 +1148,40 @@ export default function AIRecommendPage() {
               <CardTitle>Your Preferences</CardTitle>
             </CardHeader>
             <CardContent className="space-y-6">
-              {/* Hair Type */}
+              {/* Hair Type — cards with reference illustrations. Users
+                  who *know* their hair type still click quickly; the
+                  visual anchor just helps the uncertain ones without
+                  adding any AI guesswork. */}
               <div className="space-y-2">
                 <Label>Hair Type</Label>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {(["straight", "wavy", "curly", "coily"] as HairType[]).map((type) => (
-                    <Button
-                      key={type}
-                      variant={hairType === type ? "default" : "outline"}
-                      size="sm"
-                      onClick={() => setHairType(type)}
-                      className="capitalize"
-                    >
-                      {type}
-                    </Button>
-                  ))}
+                  {HAIR_TYPE_OPTIONS.map(({ type, caption }) => {
+                    const selected = hairType === type;
+                    return (
+                      <button
+                        key={type}
+                        type="button"
+                        onClick={() => setHairType(type)}
+                        aria-pressed={selected}
+                        className={`group flex flex-col items-center gap-2 rounded-lg border p-3 text-center transition-all ${
+                          selected
+                            ? "border-primary bg-primary/10 text-primary"
+                            : "border-border bg-transparent text-muted-foreground hover:border-primary/40 hover:text-foreground"
+                        }`}
+                      >
+                        <HairTypeIcon
+                          type={type}
+                          className="h-10 w-10 transition-transform group-hover:scale-105"
+                        />
+                        <span className="text-sm font-medium capitalize text-foreground">
+                          {type}
+                        </span>
+                        <span className="text-[11px] leading-tight">
+                          {caption}
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -1080,6 +1256,25 @@ export default function AIRecommendPage() {
             </Badge>
           </div>
 
+          {/* Inputs echo — makes it obvious that the user's preferences
+              actually shaped what comes next. Each chip is the value
+              they chose, in their own vocabulary. Having the tiny
+              hair-type icon beside the chip reinforces the link back
+              to the picker they just used. */}
+          <div className="flex flex-wrap items-center justify-center gap-2 text-xs">
+            <span className="text-muted-foreground">Tailored for</span>
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/5 px-2.5 py-1 font-medium text-primary capitalize">
+              <HairTypeIcon type={result.preferences.hairType} className="h-3.5 w-3.5" />
+              {result.preferences.hairType} hair
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-1 capitalize">
+              {result.preferences.desiredLength} length
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-1 capitalize">
+              {result.preferences.styleVibe} vibe
+            </span>
+          </div>
+
           {/* Recommended Styles */}
           <Card>
             <CardHeader>
@@ -1089,27 +1284,49 @@ export default function AIRecommendPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
-              {result.styles.map((style, i) => (
-                <div
-                  key={i}
-                  className="flex items-start gap-4 p-3 rounded-lg border border-border hover:border-primary/30 transition-colors"
-                >
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10 text-primary font-bold text-sm flex-shrink-0">
-                    {style.matchScore}%
-                  </div>
-                  <div className="flex-1">
-                    <p className="font-medium">{style.styleName}</p>
-                    <p className="text-sm text-muted-foreground">{style.description}</p>
-                    <div className="flex flex-wrap gap-1 mt-2">
-                      {style.categories.map((cat) => (
-                        <Badge key={cat} variant="outline" className="text-xs capitalize">
-                          {cat}
-                        </Badge>
-                      ))}
+              {result.styles.map((style, i) => {
+                // A recommendation "matches your hair type" when any of
+                // its tags overlaps with the hair-type bonus tags used
+                // by style-rules.ts. Duplicating the map here is fine
+                // — it's small and keeps the UI honest (the label only
+                // appears when the scoring actually benefited).
+                const hairMatches = styleMatchesHairType(
+                  style.tags,
+                  result.preferences.hairType,
+                );
+                return (
+                  <div
+                    key={i}
+                    className="flex items-start gap-4 p-3 rounded-lg border border-border hover:border-primary/30 transition-colors"
+                  >
+                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10 text-primary font-bold text-sm flex-shrink-0">
+                      {style.matchScore}%
+                    </div>
+                    <div className="flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-medium">{style.styleName}</p>
+                        {hairMatches && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-gold/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-gold">
+                            <HairTypeIcon
+                              type={result.preferences.hairType}
+                              className="h-3 w-3"
+                            />
+                            Great for {result.preferences.hairType} hair
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-sm text-muted-foreground">{style.description}</p>
+                      <div className="flex flex-wrap gap-1 mt-2">
+                        {style.categories.map((cat) => (
+                          <Badge key={cat} variant="outline" className="text-xs capitalize">
+                            {cat}
+                          </Badge>
+                        ))}
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </CardContent>
           </Card>
 
@@ -1125,6 +1342,31 @@ export default function AIRecommendPage() {
                   <p className="text-sm text-muted-foreground">{tip}</p>
                 </div>
               ))}
+
+              {/* Hair-type callout. Visually distinct from the generic
+                  face-shape tips so the user can see their hair-type
+                  answer actually shaped the advice. Only rendered when
+                  the rules engine produced hair-specific tips (which
+                  it does for every hair type the app supports). */}
+              {result.hairTips.length > 0 && (
+                <div className="mt-4 rounded-lg border border-gold/30 bg-gold/5 p-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <HairTypeIcon
+                      type={result.preferences.hairType}
+                      className="h-4 w-4 text-gold"
+                    />
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gold">
+                      For your {result.preferences.hairType} hair
+                    </p>
+                  </div>
+                  {result.hairTips.map((tip, i) => (
+                    <p key={i} className="text-sm text-muted-foreground leading-relaxed">
+                      {tip}
+                    </p>
+                  ))}
+                </div>
+              )}
+
               {result.avoid.length > 0 && (
                 <div className="mt-4 pt-3 border-t border-border">
                   <p className="text-sm font-medium text-destructive mb-2">Better to Avoid</p>

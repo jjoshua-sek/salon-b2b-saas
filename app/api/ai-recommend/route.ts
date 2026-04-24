@@ -31,7 +31,10 @@ export async function POST(request: NextRequest) {
   }
 
   // Get rules-based recommendations
-  const { styles, tips, avoid } = getRecommendations(faceShape as FaceShape, preferences);
+  const { styles, tips, hairTips, avoid } = getRecommendations(
+    faceShape as FaceShape,
+    preferences,
+  );
 
   // Query matching services from the salon's catalog
   const supabase = await createClient();
@@ -86,6 +89,7 @@ export async function POST(request: NextRequest) {
     faceShape,
     styles,
     tips,
+    hairTips,
     avoid,
     services: services ?? [],
     portfolio: matchedPortfolio,
