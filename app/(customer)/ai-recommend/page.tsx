@@ -24,47 +24,116 @@ import {
   classifyFaceShape,
   type FaceShape,
 } from "@/lib/ai/face-shape";
+// Types come via `import type` (erased at build time — no bundler cost)
+// so the runtime import can stay dynamic and load the WASM on demand.
+import type {
+  Results as MPResults,
+  NormalizedLandmark as MPLandmark,
+} from "@mediapipe/face_mesh";
 
-// Lazy-loaded face detector. Weights (~5-10 MB) load on demand and
-// are cached in a ref — the same instance handles both the one-shot
-// upload flow and the continuous live-camera flow.
+// ── Face detector ────────────────────────────────────────────────
+// Landmark point in frame coordinates (pixels, not normalized).
+type Landmark = { x: number; y: number };
+
+// Uniform detector interface: give it a video/image, get back an
+// array of absolute-pixel landmarks (or null if no face was found).
+// Callers don't need to care which underlying engine is in use.
+type FaceDetector = {
+  runtime: "mediapipe-direct" | "tfjs";
+  detect: (
+    source: HTMLVideoElement | HTMLImageElement,
+  ) => Promise<Landmark[] | null>;
+};
+
+// Primary path: use @mediapipe/face_mesh DIRECTLY. This is the exact
+// C++ runtime Google ships in Meet, compiled to WASM. Going around the
+// @tensorflow-models wrapper removes a whole class of failure modes
+// (WebGL init, mismatched model-zoo versions, silent CPU fallback).
 //
-// We prefer the `mediapipe` runtime (Google's official WASM build
-// via @mediapipe/face_mesh) because the `tfjs` port relies on WebGL
-// and silently falls back to CPU on some GPUs — which is the root
-// cause of "it never detects my face." If the WASM bundle fails to
-// load (CSP / offline / exotic browser), we fall back to tfjs so
-// the feature degrades instead of breaking outright.
-async function createFaceDetector() {
-  const fld = await import("@tensorflow-models/face-landmarks-detection");
+// The WASM + model binaries load from the jsDelivr CDN at the version
+// pinned in package.json — no bundler static-analysis issues.
+//
+// Fallback path: @tensorflow-models tfjs port, for environments where
+// the WASM CDN is blocked by CSP/network.
+async function createFaceDetector(): Promise<FaceDetector> {
+  // Attempt 1: direct MediaPipe WASM runtime.
   try {
-    return await fld.createDetector(fld.SupportedModels.MediaPipeFaceMesh, {
-      runtime: "mediapipe",
-      // refineLandmarks adds iris keypoints (478 vs 468). We only need
-      // the face contour for classification, so skip it — faster init
-      // and fewer failure modes.
-      refineLandmarks: false,
-      maxFaces: 1,
-      // Version-pinned CDN path matches the @mediapipe/face_mesh in
-      // package.json. If you upgrade that dep, bump this string too.
-      solutionPath:
-        "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619",
+    const mp = await import("@mediapipe/face_mesh");
+    const fm = new mp.FaceMesh({
+      locateFile: (file: string) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`,
     });
+    fm.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: false,
+      // Thresholds tuned to favor sensitivity over precision — we'd
+      // rather detect a slightly ambiguous face than silently return
+      // nothing. The stability window downstream filters out noise.
+      minDetectionConfidence: 0.4,
+      minTrackingConfidence: 0.4,
+    });
+
+    // FaceMesh pushes results through a callback. Capture the latest
+    // result in a closure-local variable that the per-tick detect()
+    // can read after send() resolves.
+    let latest: MPResults | null = null;
+    fm.onResults((r) => {
+      latest = r;
+    });
+
+    // Warm up the WASM + graph before first use. This is what the
+    // user waits on during "Warming up detector…".
+    await fm.initialize();
+
+    return {
+      runtime: "mediapipe-direct",
+      async detect(source) {
+        latest = null;
+        await fm.send({ image: source });
+        // Narrow manually: TS sees `latest` as `null` here because the
+        // onResults callback is declared above and control flow can't
+        // prove the mutation yet. Re-read as MPResults after the null
+        // guard to get back the fields.
+        const snap = latest as MPResults | null;
+        if (!snap) return null;
+        const lists = snap.multiFaceLandmarks;
+        if (!lists || lists.length === 0) return null;
+        const w =
+          source instanceof HTMLVideoElement ? source.videoWidth : source.width;
+        const h =
+          source instanceof HTMLVideoElement
+            ? source.videoHeight
+            : source.height;
+        // MediaPipe returns normalized [0,1] coords — expand to pixels
+        // so downstream shape classification (which uses pixel ratios)
+        // gets the right input.
+        return lists[0].map((p: MPLandmark) => ({ x: p.x * w, y: p.y * h }));
+      },
+    };
   } catch (mpError) {
     console.warn(
-      "[face-mesh] mediapipe runtime init failed, falling back to tfjs:",
+      "[face-mesh] direct mediapipe init failed, falling back to tfjs:",
       mpError,
     );
-    const tf = await import("@tensorflow/tfjs");
-    await tf.ready();
-    return fld.createDetector(fld.SupportedModels.MediaPipeFaceMesh, {
-      runtime: "tfjs",
-      refineLandmarks: false,
-      maxFaces: 1,
-    });
   }
+
+  // Attempt 2: tfjs fallback.
+  const tf = await import("@tensorflow/tfjs");
+  await tf.ready();
+  const fld = await import("@tensorflow-models/face-landmarks-detection");
+  const detector = await fld.createDetector(
+    fld.SupportedModels.MediaPipeFaceMesh,
+    { runtime: "tfjs", refineLandmarks: false, maxFaces: 1 },
+  );
+  return {
+    runtime: "tfjs",
+    async detect(source) {
+      const faces = await detector.estimateFaces(source);
+      if (faces.length === 0) return null;
+      return faces[0].keypoints.map((k) => ({ x: k.x, y: k.y }));
+    },
+  };
 }
-type FaceDetector = Awaited<ReturnType<typeof createFaceDetector>>;
 
 // Detection loop cadence + stability window.
 const DETECT_INTERVAL_MS = 450;   // ~2 FPS; enough to feel live, light on CPU
@@ -114,7 +183,21 @@ export default function AIRecommendPage() {
   const detectorRef = useRef<FaceDetector | null>(null);
   const ensureDetector = useCallback(async (): Promise<FaceDetector> => {
     if (!detectorRef.current) {
-      detectorRef.current = await createFaceDetector();
+      try {
+        detectorRef.current = await createFaceDetector();
+        setDebug((d) => ({
+          ...d,
+          runtime: detectorRef.current!.runtime,
+          initError: "",
+        }));
+      } catch (e) {
+        setDebug((d) => ({
+          ...d,
+          runtime: "failed",
+          initError: e instanceof Error ? e.message : String(e),
+        }));
+        throw e;
+      }
     }
     return detectorRef.current;
   }, []);
@@ -152,6 +235,20 @@ export default function AIRecommendPage() {
   // CTA — upload instead, or pick manually. Keeps the user unstuck.
   const [showFallbackHelp, setShowFallbackHelp] = useState(false);
 
+  // Diagnostics panel — exposes exactly what the detector is seeing.
+  // Invaluable when a user reports "it's not working" because it
+  // removes the guesswork of guessing why detection failed.
+  const [showDebug, setShowDebug] = useState(false);
+  const [debug, setDebug] = useState({
+    runtime: "pending" as "pending" | "mediapipe-direct" | "tfjs" | "failed",
+    initError: "",
+    ticks: 0,
+    facesFound: 0,
+    lastBrightness: 0,
+    videoW: 0,
+    videoH: 0,
+  });
+
   const goTo = useCallback((s: Step) => startTransition(() => setStep(s)), [startTransition]);
 
   // ── Photo Upload Handler ──
@@ -174,16 +271,15 @@ export default function AIRecommendPage() {
         img.onload = () => resolve();
       });
 
-      const faces = await detector.estimateFaces(img);
+      const landmarks = await detector.detect(img);
       URL.revokeObjectURL(img.src);
 
-      if (faces.length === 0) {
+      if (!landmarks) {
         setDetectionError("No face detected. Please try a clearer photo or select manually below.");
         setDetecting(false);
         return;
       }
 
-      const landmarks = faces[0].keypoints.map((kp) => ({ x: kp.x, y: kp.y }));
       const shape = classifyFaceShape(landmarks);
       setFaceShape(shape);
       setDetecting(false);
@@ -296,9 +392,20 @@ export default function AIRecommendPage() {
           }
 
           // ── Face estimation ──────────────────────────────────
-          const faces = await detector.estimateFaces(v);
+          const landmarks = await detector.detect(v);
 
-          if (faces.length === 0) {
+          // Publish diagnostics (one setState per tick keeps React
+          // re-render volume bounded even at 2 FPS).
+          setDebug((d) => ({
+            ...d,
+            ticks: d.ticks + 1,
+            facesFound: d.facesFound + (landmarks ? 1 : 0),
+            lastBrightness: Math.round(avgLum),
+            videoW: v.videoWidth,
+            videoH: v.videoHeight,
+          }));
+
+          if (!landmarks) {
             noFaceStreakRef.current++;
             // Keep the stability history: a single missed frame shouldn't
             // invalidate the last four good classifications. Only reset
@@ -329,13 +436,13 @@ export default function AIRecommendPage() {
 
           // ── Frame metrics ────────────────────────────────────
           // Compute the face's bounding box to gauge whether the
-          // user is too far, too close, or off-center.
-          const kp = faces[0].keypoints;
+          // user is too far, too close, or off-center. `landmarks` is
+          // already pixel-space thanks to createFaceDetector().
           let minX = Infinity;
           let maxX = -Infinity;
           let minY = Infinity;
           let maxY = -Infinity;
-          for (const p of kp) {
+          for (const p of landmarks) {
             if (p.x < minX) minX = p.x;
             if (p.x > maxX) maxX = p.x;
             if (p.y < minY) minY = p.y;
@@ -375,7 +482,6 @@ export default function AIRecommendPage() {
           // the sliding window slides.
           if (!goodFraming) return;
 
-          const landmarks = kp.map((k) => ({ x: k.x, y: k.y }));
           const shape = classifyFaceShape(landmarks);
 
           historyRef.current.push(shape);
@@ -649,7 +755,7 @@ export default function AIRecommendPage() {
                   {!locked && (
                     <div className="space-y-2">
                       {!showFallbackHelp && (
-                        <div className="text-center">
+                        <div className="flex items-center justify-center gap-4">
                           <button
                             type="button"
                             onClick={() => setShowFallbackHelp(true)}
@@ -657,6 +763,62 @@ export default function AIRecommendPage() {
                           >
                             Having trouble? Pick another method →
                           </button>
+                          <button
+                            type="button"
+                            onClick={() => setShowDebug((v) => !v)}
+                            className="text-xs text-muted-foreground underline-offset-4 hover:text-gold hover:underline"
+                          >
+                            {showDebug ? "Hide" : "Show"} diagnostics
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Diagnostics readout. Tells you (and me) exactly
+                          what the detector is seeing each tick, so "it
+                          doesn't detect my face" becomes debuggable
+                          instead of mysterious. */}
+                      {showDebug && (
+                        <div className="rounded-md border border-[#2a2520] bg-[#141414]/80 p-3 font-mono text-[11px] text-[#8a8478] leading-relaxed">
+                          <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+                            <span>runtime:</span>
+                            <span
+                              className={
+                                debug.runtime === "mediapipe-direct"
+                                  ? "text-gold"
+                                  : debug.runtime === "tfjs"
+                                    ? "text-yellow-500"
+                                    : debug.runtime === "failed"
+                                      ? "text-red-500"
+                                      : "text-[#8a8478]"
+                              }
+                            >
+                              {debug.runtime}
+                              {debug.runtime === "tfjs" && " (slow fallback)"}
+                            </span>
+                            <span>video:</span>
+                            <span>
+                              {debug.videoW || "—"}×{debug.videoH || "—"}
+                            </span>
+                            <span>brightness:</span>
+                            <span>{debug.lastBrightness}/255</span>
+                            <span>ticks:</span>
+                            <span>{debug.ticks}</span>
+                            <span>faces detected:</span>
+                            <span>
+                              {debug.facesFound} ·{" "}
+                              {debug.ticks > 0
+                                ? Math.round(
+                                    (debug.facesFound / debug.ticks) * 100,
+                                  )
+                                : 0}
+                              %
+                            </span>
+                          </div>
+                          {debug.initError && (
+                            <p className="mt-2 text-red-500 break-words">
+                              init error: {debug.initError}
+                            </p>
+                          )}
                         </div>
                       )}
 
